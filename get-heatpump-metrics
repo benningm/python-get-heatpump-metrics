@@ -1,0 +1,118 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+#
+# Code: https://github.com/benningm/python-get-heatpump-metrics
+# Author: Markus Benning <ich@markusbenning.de>
+
+import asyncio
+from websockets.sync.client import connect
+import xml.etree.ElementTree as ET
+import json
+import re
+import argparse
+
+class PumpValue:
+    def __init__(self, value_str):
+        self.value_str = value_str
+
+    def as_num(self):
+        if self.value_str is None:
+            return None
+        if self.value_str == 'Ein':
+            return 1
+        elif self.value_str == 'Aus':
+            return 0
+        elif re.match('^\d+', self.value_str):
+            num = re.sub('[^\d\.]+$', '', self.value_str)
+            if ':' in num:
+                return None
+            elif '.' in num:
+                return float(num)
+            else:
+                return int(num)
+        
+        return None
+
+class PumpMetrics:
+    def __init__(self, content):
+        self.data = {}
+        root = ET.fromstring(content)
+        items = root.findall("./item")
+        for item in items:
+            value = PumpValue(item[1].text).as_num()
+            if value:
+                self.data[item[0].text] = value
+
+class PumpIndex:
+    def __init__(self, content):
+        self.root = ET.fromstring(content)
+        self.topics = [
+            'Temperaturen',
+            'Eingänge',
+            'Ausgänge',
+            'Betriebsstunden',
+            'Anlagenstatus',
+            'Wärmemenge',
+            'Eingesetzte Energie',
+        ]
+        self.update_items()
+
+    def update_items(self):
+        self.items = []
+        for topic in self.topics:
+            xpath = ".//name[.='{}']/..".format(topic)
+            nodes = self.root.findall(xpath)
+            if len(nodes) < 1:
+                raise Exception('Could not find {} at {}'.format(topic, xpath))
+            self.items.append(nodes[0])
+
+class GetHeatpumpMetricsApp:
+    def __init__(self):
+        self.parse_options()
+        self.items = {}
+        self.data = {}
+
+    def parse_options(self):
+        parser = argparse.ArgumentParser(
+            prog='get-heatpump-metrics',
+            description='retrieve metrics from luxtronic heatpump')
+        parser.add_argument('host', help='hostname or address of heatpump')
+        parser.add_argument('-p', '--pin', default='999999', help='secret pin')
+        parser.add_argument('-P', '--port', type=int, default=8214, help='port of websocket interface')
+        self.args = parser.parse_args()
+
+    def run(self):
+        self.connect()
+        self.login()
+        self.refresh()
+        for section, item_id in self.items.items():
+            self.data[section] = self.retrieve_item(item_id)
+        self.disconnect()
+        print(json.dumps(self.data))
+
+    def connect(self):
+        url = "ws://{}:{}".format(self.args.host, self.args.port)
+        self.socket = connect(url, subprotocols=["Lux_WS"])
+
+    def disconnect(self):
+        self.socket.close()
+
+    def login(self):
+        self.socket.send("LOGIN;{}".format(self.args.pin))
+
+    def refresh(self):
+        self.socket.send("REFRESH")
+        message = self.socket.recv()
+        self.index = PumpIndex(message)
+        for item in self.index.items:
+            self.items[item[0].text] = item.get('id')
+
+    def retrieve_item(self, item_id):
+        self.socket.send("GET;{}".format(item_id))
+        message = self.socket.recv()
+        metrics = PumpMetrics(message)
+        return metrics.data
+
+if __name__ == "__main__":
+    GetHeatpumpMetricsApp().run()
+
